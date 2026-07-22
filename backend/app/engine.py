@@ -40,7 +40,8 @@ def llm_json(system:str, payload:dict, strong=False):
     return json.loads(response.choices[0].message.content)
 
 def build_seller_profile(client:Client)->dict:
-    texts=[fetch_text(client.main_url)]+[fetch_text(x) for x in client.extra_urls]+client.source_texts
+    uploaded=[x.get("text","") if isinstance(x,dict) else str(x) for x in client.source_texts]
+    texts=[fetch_text(client.main_url)]+[fetch_text(x) for x in client.extra_urls]+uploaded
     material="\n".join(x for x in texts if x)
     prompt="Extract a grounded seller intelligence profile as JSON. Keys: summary,strengths,weaknesses,differentiators,services,proof,ideal_customers,prohibited_claims,tone,business_outcomes,outcome_map,cta_library. Never invent claims; mark weak evidence in weaknesses."
     ai=llm_json(prompt,{"name":client.name,"urls":[client.main_url,*client.extra_urls],"material":material[:80000]})

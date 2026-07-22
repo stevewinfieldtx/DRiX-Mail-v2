@@ -3,5 +3,4 @@ WORKDIR /app
 COPY backend/pyproject.toml backend/setup.cfg ./
 COPY backend/app ./app
 RUN pip install --no-cache-dir .
-COPY backend/migrations ./migrations
 CMD ["sh","-c","python -m app.seed && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

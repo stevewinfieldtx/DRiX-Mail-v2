@@ -1,0 +1,16 @@
+fastapi<1,>=0.115
+uvicorn[standard]<1,>=0.30
+sqlalchemy<3,>=2.0
+psycopg[binary]<4,>=3.2
+pydantic-settings<3,>=2.6
+python-multipart<1,>=0.0.12
+httpx<1,>=0.27
+beautifulsoup4<5,>=4.12
+pypdf<6,>=5
+python-pptx<2,>=1.0
+openai<2,>=1.50
+email-validator<3,>=2.2
+
+[dev]
+pytest<9,>=8
+pytest-cov<6,>=5

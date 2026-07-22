@@ -14,6 +14,11 @@ class Settings(BaseSettings):
 
 settings=Settings()
 
+# Railway emits a generic PostgreSQL URL. Select the installed Psycopg 3
+# dialect explicitly so production does not attempt to import psycopg2.
+if settings.database_url.startswith("postgresql://"):
+    settings.database_url=settings.database_url.replace("postgresql://","postgresql+psycopg://",1)
+
 # The OpenAI SDK is protocol-compatible with OpenRouter. The existing model
 # pipeline therefore stays provider-neutral while these values redirect it.
 if settings.openrouter_api_key:

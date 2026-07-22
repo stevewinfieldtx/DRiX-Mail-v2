@@ -1,12 +1,13 @@
-import csv, io
+import csv, io, json, re
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 from pypdf import PdfReader
 from pptx import Presentation
+from openpyxl import load_workbook
 from .config import settings
 from .database import Base, engine, get_db
 from .models import Client, Campaign, Prospect, Evidence, Email, ClientStatus, ProspectStatus
@@ -112,19 +113,53 @@ def reply(prospect_id:str,data:ReplyIn,db:Session=Depends(get_db)):
     if not p: raise HTTPException(404,"Prospect not found")
     kind=data.kind or classify_reply(data.text); return apply_reply(db,p,kind)
 
-REQUIRED={"company_url"}
+IMPORT_FIELDS=["company_url","company_name","contact_name","contact_title","contact_email","linkedin_url","additional_urls","notes","external_campaign_id"]
+SYNONYMS={"company_url":["companyurl","website","url","domain","companywebsite","webaddress"],"company_name":["companyname","company","organization","organisation","account","businessname"],"contact_name":["contactname","fullname","name","decisionmaker","prospectname"],"contact_title":["contacttitle","title","jobtitle","role","position"],"contact_email":["contactemail","email","emailaddress","workemail"],"linkedin_url":["linkedinurl","linkedin","linkedinprofile"],"additional_urls":["additionalurls","extraurls","otherurls","sources"],"notes":["notes","context","comments","description"],"external_campaign_id":["externalcampaignid","externalid","campaignid"]}
+def _normalized(value): return re.sub(r"[^a-z0-9]","",str(value or "").lower())
+def _tabular(upload:UploadFile):
+    raw=upload.file.read(); ext=Path(upload.filename or "").suffix.lower()
+    if ext==".xlsx":
+        sheet=load_workbook(io.BytesIO(raw),read_only=True,data_only=True).active
+        values=list(sheet.iter_rows(values_only=True))
+        if not values:return [],[]
+        headers=[str(x or "").strip() for x in values[0]]
+        rows=[{headers[i]:(row[i] if i<len(row) and row[i] is not None else "") for i in range(len(headers))} for row in values[1:] if any(x is not None and str(x).strip() for x in row)]
+        return headers,rows
+    if ext not in {".csv",".txt"}: raise HTTPException(422,"Upload a .csv or .xlsx file")
+    reader=csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
+    return list(reader.fieldnames or []),list(reader)
+def _suggest(headers):
+    normalized={_normalized(h):h for h in headers}; result={}
+    for field,aliases in SYNONYMS.items():
+        match=next((normalized[a] for a in aliases if a in normalized),None)
+        if match:result[field]=match
+    return result
+
+@app.post("/api/batch/inspect")
+def batch_inspect(file:UploadFile=File(...)):
+    headers,rows=_tabular(file)
+    return {"filename":file.filename,"headers":headers,"suggested_mapping":_suggest(headers),"sample":rows[:3],"row_count":len(rows)}
+
 @app.post("/api/batch/import/{campaign_id}")
-def batch_import(campaign_id:str,file:UploadFile=File(...),db:Session=Depends(get_db)):
+def batch_import(campaign_id:str,file:UploadFile=File(...),mapping:str=Form("{}"),db:Session=Depends(get_db)):
     if not db.get(Campaign,campaign_id): raise HTTPException(404,"Campaign not found")
-    reader=csv.DictReader(io.StringIO(file.file.read().decode("utf-8-sig")))
-    if not REQUIRED.issubset(reader.fieldnames or []): raise HTTPException(422,"CSV requires company_url")
+    headers,rows=_tabular(file)
+    try:column_map=json.loads(mapping)
+    except json.JSONDecodeError:raise HTTPException(422,"Invalid column mapping")
+    column_map={field:source for field,source in column_map.items() if field in IMPORT_FIELDS and source in headers}
+    if not column_map:column_map={field:field for field in IMPORT_FIELDS if field in headers}
     created=[]; errors=[]
-    for n,row in enumerate(reader,start=2):
+    used=set(column_map.values())
+    for n,row in enumerate(rows,start=2):
         try:
-            known={k:row.get(k,"") for k in ["company_url","company_name","contact_name","contact_title","contact_email","linkedin_url","notes","external_campaign_id"]}
-            known["extra_urls"]=[u for u in row.get("additional_urls","").split("|") if u]; known["custom_fields"]={k:v for k,v in row.items() if k not in known and k!="additional_urls" and v}; p=Prospect(campaign_id=campaign_id,**known); db.add(p); db.flush(); created.append(p.id)
+            value=lambda field:str(row.get(column_map.get(field,""),"") or "").strip()
+            if not value("company_url") and not value("company_name"):raise ValueError("Map either Company URL or Company Name")
+            known={k:value(k) for k in ["company_url","company_name","contact_name","contact_title","contact_email","linkedin_url","notes","external_campaign_id"]}
+            known["extra_urls"]=[u.strip() for u in re.split(r"[|,\n]",value("additional_urls")) if u.strip()]
+            known["custom_fields"]={k:v for k,v in row.items() if k not in used and v not in (None,"")}
+            p=Prospect(campaign_id=campaign_id,**known); db.add(p); db.flush(); created.append(p.id)
         except Exception as exc: errors.append({"row":n,"error":str(exc)})
-    db.commit(); return {"created":len(created),"prospect_ids":created,"errors":errors}
+    db.commit(); return {"created":len(created),"prospect_ids":created,"errors":errors,"mapping":column_map}
 
 EXPORT_FIELDS=["prospect_id","company_name","company_url","contact_name","contact_title","contact_email","campaign_name","campaign_stage","email_number","subject","body","cta","confidence_score","narrative_type","primary_business_outcome","proof_used","research_summary","generated_at","status","send_after","stop_if_replied","thread_subject","sequence_id","external_campaign_id"]
 @app.get("/api/batch/export/{campaign_id}")

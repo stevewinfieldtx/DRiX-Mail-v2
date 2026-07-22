@@ -29,6 +29,15 @@ def clients(db:Session=Depends(get_db)): return db.scalars(select(Client).order_
 def create_client(data:ClientCreate,db:Session=Depends(get_db)):
     c=Client(**data.model_dump()); db.add(c); db.commit(); db.refresh(c); return c
 
+@app.delete("/api/clients/{client_id}")
+def delete_client(client_id:str,db:Session=Depends(get_db)):
+    c=db.get(Client,client_id)
+    if not c: raise HTTPException(404,"Client not found")
+    if c.status!=ClientStatus.draft: raise HTTPException(409,"Only draft clients can be deleted")
+    if c.campaigns: raise HTTPException(409,"Draft client has campaigns and cannot be deleted")
+    db.delete(c); db.commit()
+    return {"deleted":client_id}
+
 def extract_upload(upload:UploadFile)->str:
     raw=upload.file.read(); ext=Path(upload.filename or "").suffix.lower()
     if ext==".pdf": return "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(raw)).pages)

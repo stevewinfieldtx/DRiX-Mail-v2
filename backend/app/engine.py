@@ -33,11 +33,26 @@ def fetch_text(url:str)->str:
         return " ".join(soup.get_text(" ",strip=True).split())[:30000]
     except Exception: return ""
 
+def _json_content(value:str):
+    value=(value or "").strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:return json.loads(value)
+    except json.JSONDecodeError:
+        match=re.search(r"\{.*\}",value,re.S)
+        return json.loads(match.group(0)) if match else None
+
 def llm_json(system:str, payload:dict, strong=False):
     if not settings.openai_api_key: return None
     client=OpenAI(api_key=settings.openai_api_key)
-    response=client.chat.completions.create(model=settings.strategy_model if strong else settings.extraction_model,response_format={"type":"json_object"},temperature=.2,messages=[{"role":"system","content":system},{"role":"user","content":json.dumps(payload)}])
-    return json.loads(response.choices[0].message.content)
+    args={"model":settings.strategy_model if strong else settings.extraction_model,"temperature":.2,"messages":[{"role":"system","content":system+" Return one valid JSON object and no prose."},{"role":"user","content":json.dumps(payload)}]}
+    try:
+        response=client.chat.completions.create(**args,response_format={"type":"json_object"})
+        return _json_content(response.choices[0].message.content)
+    except Exception:
+        try:
+            response=client.chat.completions.create(**args)
+            return _json_content(response.choices[0].message.content)
+        except Exception:
+            return None
 
 def build_seller_profile(client:Client)->dict:
     uploaded=[x.get("text","") if isinstance(x,dict) else str(x) for x in client.source_texts]

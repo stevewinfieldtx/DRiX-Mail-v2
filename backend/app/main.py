@@ -116,17 +116,6 @@ def reply(prospect_id:str,data:ReplyIn,db:Session=Depends(get_db)):
 IMPORT_FIELDS=["company_url","company_name","contact_name","contact_title","contact_email","linkedin_url","additional_urls","notes","external_campaign_id"]
 SYNONYMS={"company_url":["companyurl","website","url","domain","companywebsite","webaddress"],"company_name":["companyname","company","organization","organisation","account","businessname"],"contact_name":["contactname","fullname","name","decisionmaker","prospectname"],"contact_title":["contacttitle","title","jobtitle","role","position"],"contact_email":["contactemail","email","emailaddress","workemail"],"linkedin_url":["linkedinurl","linkedin","linkedinprofile"],"additional_urls":["additionalurls","extraurls","otherurls","sources"],"notes":["notes","context","comments","description"],"external_campaign_id":["externalcampaignid","externalid","campaignid"]}
 def _normalized(value): return re.sub(r"[^a-z0-9]","",str(value or "").lower())
-def _xlsx_header_row(values):
-    """Find the real column header row, ignoring report titles and blank lead-in rows."""
-    candidates=[]
-    aliases={alias for names in SYNONYMS.values() for alias in names}
-    for index,row in enumerate(values[:50]):
-        cells=[str(value).strip() for value in row if value is not None and str(value).strip()]
-        if not cells:continue
-        recognized=sum(1 for cell in cells if _normalized(cell) in aliases)
-        candidates.append((recognized,len(cells),-index,index))
-    return max(candidates)[-1] if candidates else None
-
 def _xlsx_columns(row):
     columns=[]; seen={}
     for index,value in enumerate(row):
@@ -141,10 +130,9 @@ def _tabular(upload:UploadFile):
     if ext==".xlsx":
         sheet=load_workbook(io.BytesIO(raw),read_only=True,data_only=True).active
         values=list(sheet.iter_rows(values_only=True))
-        header_index=_xlsx_header_row(values)
-        if header_index is None:return [],[]
-        columns=_xlsx_columns(values[header_index]); headers=[label for _,label in columns]
-        rows=[{label:(row[index] if index<len(row) and row[index] is not None else "") for index,label in columns} for row in values[header_index+1:] if any(index<len(row) and row[index] is not None and str(row[index]).strip() for index,_ in columns)]
+        if not values:return [],[]
+        columns=_xlsx_columns(values[0]); headers=[label for _,label in columns]
+        rows=[{label:(row[index] if index<len(row) and row[index] is not None else "") for index,label in columns} for row in values[1:] if any(index<len(row) and row[index] is not None and str(row[index]).strip() for index,_ in columns)]
         return headers,rows
     if ext not in {".csv",".txt"}: raise HTTPException(422,"Upload a .csv or .xlsx file")
     reader=csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))

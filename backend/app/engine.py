@@ -100,18 +100,48 @@ def _local_email(p:Prospect,stage:int,cta:str):
     ]
     return subjects[stage-1], chapters[stage-1]+"\n\n"+cta
 
+def _words(text:str):return re.findall(r"\b[\w'’$€£%–-]+\b",text or "")
+
+def _sentences(text:str):
+    clean=" ".join((text or "").replace("\n"," ").split())
+    return [x.strip() for x in re.findall(r"[^.!?]+[.!?]?",clean) if x.strip()]
+
+def _unsupported_numbers(sentence:str,approved:str):
+    numbers=re.findall(r"[$€£]?\d+(?:[.,]\d+)*(?:\s*[–-]\s*\d+)?\s*(?:%|[KMBkmb])?",sentence)
+    return any(number.strip().lower() not in approved.lower() for number in numbers)
+
+def enforce_email_limits(subject:str,body:str,cta:str,approved:str):
+    """Hard output guardrail: four-word subject, three content sentences plus CTA, 100 words total."""
+    subject=" ".join((subject or "Relevant next step").split()[:4]).strip(" ,:;-–")
+    content=(body or "").replace(cta or "","").strip()
+    sentences=[sentence for sentence in _sentences(content) if not _unsupported_numbers(sentence,approved)][:3]
+    cta=(cta or DEFAULT_CTAS[0]).strip()
+    budget=max(1,100-len(_words(cta))); kept=[]; used=0
+    for sentence in sentences:
+        count=len(_words(sentence))
+        if used+count<=budget:kept.append(sentence); used+=count
+        elif not kept:
+            kept.append(" ".join(sentence.split()[:budget]).rstrip(" ,:;-–")+"."); break
+    if not kept:kept=["A brief comparison may help determine whether this approach fits your current priorities."]
+    return subject,"\n\n".join(kept+[cta])
 def generate_next(db:Session,p:Prospect):
     if p.status in {ProspectStatus.replied,ProspectStatus.closed,ProspectStatus.suppressed,ProspectStatus.meeting}: raise ValueError("Sequence is stopped")
+    profile=p.campaign.client.profile
     ready=next((e for e in p.emails if e.status==EmailStatus.ready),None)
-    if ready: return ready
+    if ready:
+        approved=json.dumps({"seller":profile,"prospect":p.strategic_brief},default=str)
+        ready.subject,ready.body=enforce_email_limits(ready.subject,ready.body,ready.cta,approved)
+        ready.thread_subject=ready.subject; db.commit(); db.refresh(ready); return ready
     stage=p.stage+1
     if stage>5: p.status=ProspectStatus.closed; p.next_action="sequence complete"; db.commit(); raise ValueError("Sequence complete")
-    profile=p.campaign.client.profile; ctas=profile.get("cta_library") or DEFAULT_CTAS; cta=ctas[min(stage-1,len(ctas)-1)]
+    ctas=profile.get("cta_library") or DEFAULT_CTAS; cta=ctas[min(stage-1,len(ctas)-1)]
     history=[{"number":e.number,"subject":e.subject,"body":e.body} for e in sorted(p.emails,key=lambda x:x.number)]
-    rule="Write one concise B2B email as JSON subject,body,cta. Ground every company-specific assertion in evidence. For inference use conditional language. Never invent facts. Subject uses observation/pattern/contrast/prediction/consequence/curiosity and not a name token. Continue the blueprint without repeating prior email."
+    rule="Write one concise B2B cold email as JSON subject,body,cta. For email 1, target 65-85 words; every email must be 50-100 words total including CTA and no more than four sentences. Subject must be 2-4 words and use observation, pattern, contrast, prediction, consequence, or curiosity—not a name token. Ground every company-specific assertion and every number in supplied evidence or approved seller proof. For inference use conditional language. Never invent facts, pain, salaries, timelines, savings, customers, outcomes, or urgency. Continue the blueprint without repeating prior email."
     ai=llm_json(rule,{"seller":profile,"prospect":p.strategic_brief,"blueprint":p.blueprint,"stage":stage,"history":history,"selected_cta":cta},strong=True)
     subject,body=(ai.get("subject"),ai.get("body")) if ai else _local_email(p,stage,cta)
-    if ai: cta=ai.get("cta",cta); body=body.rstrip()+"\n\n"+cta if cta not in body else body
+    if ai: cta=ai.get("cta",cta)
+    approved=json.dumps({"seller":profile,"prospect":p.strategic_brief},default=str)
+    subject,body=enforce_email_limits(subject,body,cta,approved)
     e=Email(prospect_id=p.id,number=stage,subject=subject[:300],body=body,cta=cta,narrative_type=p.blueprint[stage-1]["chapter"],primary_business_outcome=p.strategic_brief.get("primary_business_outcome",""),proof_used=p.strategic_brief.get("proof",""),research_summary=p.strategic_brief.get("research_summary",""),thread_subject=subject)
     db.add(e); p.status=ProspectStatus.ready; p.next_action=f"send/export email {stage}"; db.commit(); db.refresh(e); return e
 

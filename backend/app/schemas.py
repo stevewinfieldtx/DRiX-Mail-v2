@@ -9,5 +9,6 @@ class CampaignOut(ORM): id:str; client_id:str; name:str; target_audience:str; ac
 class ProspectCreate(BaseModel): campaign_id:str; company_url:str; company_name:str=""; contact_name:str=""; contact_title:str=""; contact_email:str=""; linkedin_url:str=""; extra_urls:list[str]=[]; notes:str=""; custom_fields:dict[str,Any]={}; external_campaign_id:str=""
 class ProspectOut(ORM): id:str; campaign_id:str; company_url:str; company_name:str; contact_name:str; contact_title:str; contact_email:str; status:str; stage:int; confidence:float; reply_status:str; next_action:str; strategic_brief:dict; blueprint:list
 class EmailOut(ORM): id:str; prospect_id:str; number:int; subject:str; body:str; cta:str; status:str; narrative_type:str; primary_business_outcome:str
+class EmailUpdate(BaseModel): subject:str; body:str; cta:str
 class ProfileUpdate(BaseModel): profile:dict[str,Any]
 class ReplyIn(BaseModel): text:str; kind:str|None=None

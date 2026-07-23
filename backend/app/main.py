@@ -11,7 +11,7 @@ from openpyxl import load_workbook
 from .config import settings
 from .database import Base, engine, get_db
 from .models import Client, Campaign, Prospect, Evidence, Email, ClientStatus, ProspectStatus
-from .schemas import ClientCreate, ClientOut, CampaignCreate, CampaignOut, ProspectCreate, ProspectOut, EmailOut, ProfileUpdate, ReplyIn
+from .schemas import ClientCreate, ClientOut, CampaignCreate, CampaignOut, ProspectCreate, ProspectOut, EmailOut, EmailUpdate, ProfileUpdate, ReplyIn
 from .engine import build_seller_profile, research, generate_next, mark_sent, classify_reply, apply_reply
 
 app=FastAPI(title="B2B Narrative Platform",version="1.0.0")
@@ -101,6 +101,14 @@ def next_email(prospect_id:str,db:Session=Depends(get_db)):
     try:return generate_next(db,p)
     except ValueError as e: raise HTTPException(409,str(e))
 
+@app.patch("/api/emails/{email_id}",response_model=EmailOut)
+def update_email(email_id:str,data:EmailUpdate,db:Session=Depends(get_db)):
+    e=db.get(Email,email_id)
+    if not e:raise HTTPException(404,"Email not found")
+    if e.status.value!="ready":raise HTTPException(409,"Only ready emails can be edited")
+    e.subject=data.subject.strip()[:300]; e.body=data.body.strip(); e.cta=data.cta.strip()
+    db.commit(); db.refresh(e); return e
+
 @app.post("/api/emails/{email_id}/sent",response_model=ProspectOut)
 def sent(email_id:str,db:Session=Depends(get_db)):
     e=db.scalar(select(Email).options(joinedload(Email.prospect).joinedload(Prospect.campaign)).where(Email.id==email_id))
@@ -128,11 +136,18 @@ def _xlsx_columns(row):
 def _tabular(upload:UploadFile):
     raw=upload.file.read(); ext=Path(upload.filename or "").suffix.lower()
     if ext==".xlsx":
-        sheet=load_workbook(io.BytesIO(raw),read_only=True,data_only=True).active
-        values=list(sheet.iter_rows(values_only=True))
-        if not values:return [],[]
-        columns=_xlsx_columns(values[0]); headers=[label for _,label in columns]
-        rows=[{label:(row[index] if index<len(row) and row[index] is not None else "") for index,label in columns} for row in values[1:] if any(index<len(row) and row[index] is not None and str(row[index]).strip() for index,_ in columns)]
+        workbook=load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
+        candidates=[]
+        aliases={alias for names in SYNONYMS.values() for alias in names}
+        for position,sheet in enumerate(workbook.worksheets):
+            first_row=next(sheet.iter_rows(min_row=1,max_row=1,values_only=True),())
+            columns=_xlsx_columns(first_row)
+            recognized=sum(1 for _,label in columns if _normalized(label) in aliases)
+            candidates.append((len(columns),recognized,-position,sheet,columns))
+        if not candidates:return [],[]
+        _,_,_,sheet,columns=max(candidates,key=lambda item:item[:3])
+        headers=[label for _,label in columns]
+        rows=[{label:(row[index] if index<len(row) and row[index] is not None else "") for index,label in columns} for row in sheet.iter_rows(min_row=2,values_only=True) if any(index<len(row) and row[index] is not None and str(row[index]).strip() for index,_ in columns)]
         return headers,rows
     if ext not in {".csv",".txt"}: raise HTTPException(422,"Upload a .csv or .xlsx file")
     reader=csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
@@ -171,22 +186,31 @@ def batch_import(campaign_id:str,file:UploadFile=File(...),mapping:str=Form("{}"
     db.commit(); return {"created":len(created),"prospect_ids":created,"errors":errors,"mapping":column_map}
 
 EXPORT_FIELDS=["prospect_id","company_name","company_url","contact_name","contact_title","contact_email","campaign_name","campaign_stage","email_number","subject","body","cta","confidence_score","narrative_type","primary_business_outcome","proof_used","research_summary","generated_at","status","send_after","stop_if_replied","thread_subject","sequence_id","external_campaign_id"]
-@app.get("/api/batch/export/{campaign_id}")
-def batch_export(campaign_id:str,generate:bool=True,db:Session=Depends(get_db)):
-    ps=db.scalars(select(Prospect).options(joinedload(Prospect.emails),joinedload(Prospect.campaign).joinedload(Campaign.client)).where(Prospect.campaign_id==campaign_id)).unique().all(); out=io.StringIO(); w=csv.DictWriter(out,fieldnames=EXPORT_FIELDS); w.writeheader()
+def _next_email_csv(ps,generate,db,filename="next-emails.csv"):
+    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=EXPORT_FIELDS); w.writeheader()
     for p in ps:
-        if p.status in {ProspectStatus.closed,ProspectStatus.suppressed,ProspectStatus.meeting,ProspectStatus.replied}: continue
+        if p.status in {ProspectStatus.closed,ProspectStatus.suppressed,ProspectStatus.meeting,ProspectStatus.replied}:continue
         e=next((x for x in p.emails if x.status.value=="ready"),None)
         if not e and generate:
-            if p.status==ProspectStatus.new: research(db,p)
+            if p.status==ProspectStatus.new:research(db,p)
             if p.status!=ProspectStatus.waiting or not p.due_at or p.due_at.isoformat() <= __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat():
                 try:e=generate_next(db,p)
                 except ValueError:continue
-        if not e: continue
+        if not e:continue
         w.writerow({"prospect_id":p.id,"company_name":p.company_name,"company_url":p.company_url,"contact_name":p.contact_name,"contact_title":p.contact_title,"contact_email":p.contact_email,"campaign_name":p.campaign.name,"campaign_stage":p.stage,"email_number":e.number,"subject":e.subject,"body":e.body,"cta":e.cta,"confidence_score":p.confidence,"narrative_type":e.narrative_type,"primary_business_outcome":e.primary_business_outcome,"proof_used":e.proof_used,"research_summary":e.research_summary,"generated_at":e.generated_at.isoformat(),"status":e.status.value,"send_after":p.due_at.isoformat() if p.due_at else "","stop_if_replied":True,"thread_subject":e.thread_subject,"sequence_id":e.sequence_id,"external_campaign_id":p.external_campaign_id})
-    out.seek(0); return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=next-emails.csv"})
+    out.seek(0)
+    return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":f"attachment; filename={filename}"})
 
+@app.get("/api/batch/export-all")
+def batch_export_all(generate:bool=False,db:Session=Depends(get_db)):
+    ps=db.scalars(select(Prospect).options(joinedload(Prospect.emails),joinedload(Prospect.campaign).joinedload(Campaign.client))).unique().all()
+    return _next_email_csv(ps,generate,db,"all-ready-emails.csv")
+
+@app.get("/api/batch/export/{campaign_id}")
+def batch_export(campaign_id:str,generate:bool=True,db:Session=Depends(get_db)):
+    ps=db.scalars(select(Prospect).options(joinedload(Prospect.emails),joinedload(Prospect.campaign).joinedload(Campaign.client)).where(Prospect.campaign_id==campaign_id)).unique().all()
+    return _next_email_csv(ps,generate,db)
 @app.get("/api/dashboard")
 def dashboard(db:Session=Depends(get_db)):
     ps=db.scalars(select(Prospect).options(joinedload(Prospect.campaign).joinedload(Campaign.client)).order_by(Prospect.due_at.nullsfirst())).all()
-    return [{"prospect_id":p.id,"client":p.campaign.client.name,"campaign":p.campaign.name,"prospect":p.company_name or p.company_url,"stage":p.stage,"last_action":max([e.sent_at or e.generated_at for e in p.emails],default=p.created_at),"reply_status":p.reply_status,"confidence":p.confidence,"due_date":p.due_at,"next":p.next_action,"status":p.status.value} for p in ps]
+    return [{"prospect_id":p.id,"campaign_id":p.campaign_id,"client":p.campaign.client.name,"campaign":p.campaign.name,"prospect":p.company_name or p.company_url,"stage":p.stage,"last_action":max([e.sent_at or e.generated_at for e in p.emails],default=p.created_at),"reply_status":p.reply_status,"confidence":p.confidence,"due_date":p.due_at,"next":p.next_action,"status":p.status.value} for p in ps]

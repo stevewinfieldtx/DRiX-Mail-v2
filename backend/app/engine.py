@@ -111,12 +111,12 @@ def _unsupported_numbers(sentence:str,approved:str):
     return any(number.strip().lower() not in approved.lower() for number in numbers)
 
 def enforce_email_limits(subject:str,body:str,cta:str,approved:str):
-    """Hard output guardrail: four-word subject, three content sentences plus CTA, 100 words total."""
+    """Hard output guardrail: four-word subject and 95 words maximum; sentence count is guidance, not a hard cap."""
     subject=" ".join((subject or "Relevant next step").split()[:4]).strip(" ,:;-–")
     content=(body or "").replace(cta or "","").strip()
-    sentences=[sentence for sentence in _sentences(content) if not _unsupported_numbers(sentence,approved)][:3]
+    sentences=[sentence for sentence in _sentences(content) if not _unsupported_numbers(sentence,approved)]
     cta=(cta or DEFAULT_CTAS[0]).strip()
-    budget=max(1,100-len(_words(cta))); kept=[]; used=0
+    budget=max(1,95-len(_words(cta))); kept=[]; used=0
     for sentence in sentences:
         count=len(_words(sentence))
         if used+count<=budget:kept.append(sentence); used+=count
@@ -124,27 +124,59 @@ def enforce_email_limits(subject:str,body:str,cta:str,approved:str):
             kept.append(" ".join(sentence.split()[:budget]).rstrip(" ,:;-–")+"."); break
     if not kept:kept=["A brief comparison may help determine whether this approach fits your current priorities."]
     return subject,"\n\n".join(kept+[cta])
+def _grounded_fallback(p:Prospect,cta:str):
+    seller=getattr(p.campaign.client,"name","Our team")
+    outcome=p.strategic_brief.get("primary_business_outcome","more predictable execution")
+    subject="Balancing growth and capacity"
+    body=("Companies at this stage often find that growth creates more competing priorities than the core team can address at once. "
+          "The question is not necessarily whether to add resources, but how to preserve momentum without increasing operating risk or distracting senior leaders from decisions only they can make. "
+          f"{seller} helps teams connect added execution capacity to {outcome} while keeping product direction and core ownership internal as priorities, evidence, customer needs, and timelines continue to change. "
+          "That can create a more flexible path between today's roadmap and the next meaningful business milestone.")
+    return subject,body,cta
+
+def fit_email_to_band(p:Prospect,stage:int,subject:str,body:str,cta:str,profile:dict):
+    approved=json.dumps({"seller":profile,"prospect":p.strategic_brief},default=str)
+    for _ in range(2):
+        subject,body=enforce_email_limits(subject,body,cta,approved)
+        if 75<=len(_words(body))<=95:return subject,body,cta
+        revised=llm_json("Rewrite this cold email to 75-95 words total including the CTA, with clear short paragraphs and a 2-4 word subject. Preserve only supplied facts and conditional inferences. Do not add numbers or claims. Return subject, body, and CTA.",{"subject":subject,"body":body,"cta":cta,"approved_context":json.loads(approved)},strong=True)
+        if revised:subject,body,cta=revised.get("subject",subject),revised.get("body",body),revised.get("cta",cta)
+        else:break
+    subject,body,cta=_grounded_fallback(p,cta)
+    subject,body=enforce_email_limits(subject,body,cta,approved)
+    if not 75<=len(_words(body))<=95:raise ValueError("Email could not be fitted to the required 75-95 word range")
+    return subject,body,cta
 def generate_next(db:Session,p:Prospect):
     if p.status in {ProspectStatus.replied,ProspectStatus.closed,ProspectStatus.suppressed,ProspectStatus.meeting}: raise ValueError("Sequence is stopped")
     profile=p.campaign.client.profile
     ready=next((e for e in p.emails if e.status==EmailStatus.ready),None)
     if ready:
-        approved=json.dumps({"seller":profile,"prospect":p.strategic_brief},default=str)
-        ready.subject,ready.body=enforce_email_limits(ready.subject,ready.body,ready.cta,approved)
+        ready.subject,ready.body,ready.cta=fit_email_to_band(p,ready.number,ready.subject,ready.body,ready.cta,profile)
         ready.thread_subject=ready.subject; db.commit(); db.refresh(ready); return ready
     stage=p.stage+1
     if stage>5: p.status=ProspectStatus.closed; p.next_action="sequence complete"; db.commit(); raise ValueError("Sequence complete")
     ctas=profile.get("cta_library") or DEFAULT_CTAS; cta=ctas[min(stage-1,len(ctas)-1)]
     history=[{"number":e.number,"subject":e.subject,"body":e.body} for e in sorted(p.emails,key=lambda x:x.number)]
-    rule="Write one concise B2B cold email as JSON subject,body,cta. For email 1, target 65-85 words; every email must be 50-100 words total including CTA and no more than four sentences. Subject must be 2-4 words and use observation, pattern, contrast, prediction, consequence, or curiosity—not a name token. Ground every company-specific assertion and every number in supplied evidence or approved seller proof. For inference use conditional language. Never invent facts, pain, salaries, timelines, savings, customers, outcomes, or urgency. Continue the blueprint without repeating prior email."
+    rule="Write one concise B2B cold email as JSON subject,body,cta. Every email must be 75-95 words total including CTA—never shorter or longer with short, readable paragraphs. Subject must be 2-4 words and use observation, pattern, contrast, prediction, consequence, or curiosity—not a name token. Ground every company-specific assertion and every number in supplied evidence or approved seller proof. For inference use conditional language. Never invent facts, pain, salaries, timelines, savings, customers, outcomes, or urgency. Continue the blueprint without repeating prior email."
     ai=llm_json(rule,{"seller":profile,"prospect":p.strategic_brief,"blueprint":p.blueprint,"stage":stage,"history":history,"selected_cta":cta},strong=True)
     subject,body=(ai.get("subject"),ai.get("body")) if ai else _local_email(p,stage,cta)
     if ai: cta=ai.get("cta",cta)
-    approved=json.dumps({"seller":profile,"prospect":p.strategic_brief},default=str)
-    subject,body=enforce_email_limits(subject,body,cta,approved)
+    subject,body,cta=fit_email_to_band(p,stage,subject,body,cta,profile)
     e=Email(prospect_id=p.id,number=stage,subject=subject[:300],body=body,cta=cta,narrative_type=p.blueprint[stage-1]["chapter"],primary_business_outcome=p.strategic_brief.get("primary_business_outcome",""),proof_used=p.strategic_brief.get("proof",""),research_summary=p.strategic_brief.get("research_summary",""),thread_subject=subject)
     db.add(e); p.status=ProspectStatus.ready; p.next_action=f"send/export email {stage}"; db.commit(); db.refresh(e); return e
 
+def regenerate_ready(db:Session,e:Email):
+    if e.status!=EmailStatus.ready:raise ValueError("Only a ready email can be regenerated")
+    p=e.prospect; profile=p.campaign.client.profile; stage=e.number
+    ctas=profile.get("cta_library") or DEFAULT_CTAS; cta=e.cta or ctas[min(stage-1,len(ctas)-1)]
+    history=[{"number":item.number,"subject":item.subject,"body":item.body} for item in sorted(p.emails,key=lambda item:item.number) if item.id!=e.id]
+    rule="Write a genuinely different version of this B2B cold email as JSON subject,body,cta. Every email must be 75-95 words total including CTA—never shorter or longer—with short readable paragraphs. Subject must be 2-4 words. Ground every company-specific assertion and number in supplied evidence or approved seller proof. Never invent facts, pain, salaries, timelines, savings, customers, outcomes, or urgency. Continue the assigned narrative stage without repeating prior emails."
+    ai=llm_json(rule,{"seller":profile,"prospect":p.strategic_brief,"blueprint":p.blueprint,"stage":stage,"history":history,"rejected_version":{"subject":e.subject,"body":e.body,"cta":e.cta},"selected_cta":cta},strong=True)
+    subject,body=(ai.get("subject"),ai.get("body")) if ai else _local_email(p,stage,cta)
+    if ai:cta=ai.get("cta",cta)
+    subject,body,cta=fit_email_to_band(p,stage,subject,body,cta,profile)
+    e.subject=subject; e.body=body; e.cta=cta; e.thread_subject=subject; e.generated_at=datetime.now(timezone.utc)
+    db.commit(); db.refresh(e); return e
 def mark_sent(db:Session,e:Email):
     e.status=EmailStatus.sent; e.sent_at=datetime.now(timezone.utc); p=e.prospect; p.stage=e.number; p.status=ProspectStatus.waiting; days=p.campaign.cadence_days[min(e.number,len(p.campaign.cadence_days)-1)]; p.due_at=datetime.now(timezone.utc)+timedelta(days=days); p.next_action="wait for reply" if e.number==5 else f"generate email {e.number+1} when due"; db.commit(); return p
 

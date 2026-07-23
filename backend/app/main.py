@@ -12,7 +12,7 @@ from .config import settings
 from .database import Base, engine, get_db
 from .models import Client, Campaign, Prospect, Evidence, Email, ClientStatus, ProspectStatus
 from .schemas import ClientCreate, ClientOut, CampaignCreate, CampaignOut, ProspectCreate, ProspectOut, EmailOut, EmailUpdate, ProfileUpdate, ReplyIn
-from .engine import build_seller_profile, research, generate_next, mark_sent, classify_reply, apply_reply
+from .engine import build_seller_profile, research, generate_next, regenerate_ready, mark_sent, classify_reply, apply_reply
 
 app=FastAPI(title="B2B Narrative Platform",version="1.0.0")
 app.add_middleware(CORSMiddleware,allow_origins=settings.cors_origins.split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
@@ -108,6 +108,13 @@ def update_email(email_id:str,data:EmailUpdate,db:Session=Depends(get_db)):
     if e.status.value!="ready":raise HTTPException(409,"Only ready emails can be edited")
     e.subject=data.subject.strip()[:300]; e.body=data.body.strip(); e.cta=data.cta.strip()
     db.commit(); db.refresh(e); return e
+
+@app.post("/api/emails/{email_id}/regenerate",response_model=EmailOut)
+def regenerate(email_id:str,db:Session=Depends(get_db)):
+    e=db.scalar(select(Email).options(joinedload(Email.prospect).joinedload(Prospect.campaign).joinedload(Campaign.client),joinedload(Email.prospect).joinedload(Prospect.emails)).where(Email.id==email_id))
+    if not e:raise HTTPException(404,"Email not found")
+    try:return regenerate_ready(db,e)
+    except ValueError as exc:raise HTTPException(409,str(exc))
 
 @app.post("/api/emails/{email_id}/sent",response_model=ProspectOut)
 def sent(email_id:str,db:Session=Depends(get_db)):

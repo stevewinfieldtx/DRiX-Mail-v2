@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 import pytest
-from app.engine import kind_for, usable_claim, classify_reply, generate_next, apply_reply, enforce_email_limits
+from app.engine import kind_for, usable_claim, classify_reply, generate_next, apply_reply, enforce_email_limits, fit_email_to_band
 from app.models import EvidenceKind, Evidence, ProspectStatus, EmailStatus
 
 def test_confidence_boundaries():
@@ -39,21 +39,26 @@ def test_generated_email_has_hard_length_and_subject_limits():
     long_body=" ".join(["Roadmap pressure can consume engineering attention and delay customer learning."]*14)
     subject,body=enforce_email_limits("A very long personalized subject line here",long_body,"Worth a brief conversation?","")
     assert len(subject.split())<=4
-    assert len(body.split())<=100
-    assert len([x for x in __import__('re').findall(r"[^.!?]+[.!?]?",body) if x.strip()])<=4
+    assert len(body.split())<=95
     assert body.endswith("Worth a brief conversation?")
 
+def test_short_email_is_rewritten_or_falls_back_into_75_to_95_words(monkeypatch):
+    monkeypatch.setattr("app.engine.llm_json",lambda *a,**k:None)
+    p=prospect(); subject,body,cta=fit_email_to_band(p,1,"Funding signal","Your funding suggests growth.\n\nTalk to our team","Talk to our team",p.campaign.client.profile)
+    assert 75<=len(body.split())<=95
+    assert len(subject.split())<=4
+    assert body.endswith(cta)
 def test_unsupported_numbers_are_removed():
     source="Domestic engineers cost $180K and take 4 months to ramp. Engineering capacity can affect roadmap timing."
     _,body=enforce_email_limits("Hiring economics now",source,"Open to comparing notes?","")
     assert "$180K" not in body and "4 months" not in body
     assert "roadmap timing" in body
 def test_existing_ready_email_is_normalized_when_reopened(monkeypatch):
-    p=prospect(); existing=SimpleNamespace(status=EmailStatus.ready,subject="An unnecessarily long subject about engineering capacity",body=" ".join(["This is an overly long sentence about delivery capacity."]*20),cta="Open to comparing notes?",thread_subject="")
+    p=prospect(); existing=SimpleNamespace(status=EmailStatus.ready,number=1,subject="An unnecessarily long subject about engineering capacity",body=" ".join(["This is an overly long sentence about delivery capacity."]*20),cta="Open to comparing notes?",thread_subject="")
     p.emails=[existing]; returned=generate_next(DB(),p)
     assert returned is existing
     assert len(returned.subject.split())<=4
-    assert len(returned.body.split())<=100
+    assert 75<=len(returned.body.split())<=95
 def test_stop_condition_blocks_generation(monkeypatch):
     p=prospect();p.status=ProspectStatus.suppressed
     with pytest.raises(ValueError,match="stopped"):generate_next(DB(),p)
